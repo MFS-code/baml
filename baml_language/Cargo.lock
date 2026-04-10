@@ -1831,6 +1831,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "bridge_go"
+version = "0.0.0-beta"
+dependencies = [
+ "bex_events",
+ "bex_project",
+ "bridge_cffi",
+ "bridge_ctypes",
+ "futures",
+ "libc",
+ "log",
+ "once_cell",
+ "prost",
+ "serde_json",
+ "sys_native",
+ "sys_types",
+ "tokio",
+]
+
+[[package]]
 name = "bridge_nodejs"
 version = "0.0.0-beta"
 dependencies = [
