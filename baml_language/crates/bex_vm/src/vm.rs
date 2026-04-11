@@ -1385,44 +1385,69 @@ impl BexVm {
                     NativeCallResult::Done(v) => {
                         self.stack.push(v);
                     }
-                    NativeCallResult::Error(VmRustFnError::Panic(panic)) => {
-                        return Err(VmError::Thrown(self.panic_to_exception_value(panic)));
-                    }
-                    NativeCallResult::Error(VmRustFnError::BamlError(err)) => {
-                        return Err(VmError::Thrown(self.error_to_exception_value(err)));
-                    }
-                    NativeCallResult::Error(VmRustFnError::InternalError(err)) => {
-                        return Err(VmError::InternalError(err));
+                    NativeCallResult::Error(e) => {
+                        return Err(self.native_error_to_vm_error(e));
                     }
                     NativeCallResult::YieldToCall {
-                        callee,
-                        args: callback_args,
-                        continuation,
+                        callee: mut cb_callee,
+                        args: mut cb_args,
+                        continuation: mut cb_cont,
                     } => {
-                        // Push a Native frame so that when the callback returns
-                        // we can resume the continuation.
-                        self.frames.push(Frame::Native(NativeFrame {
-                            function: callee_ptr,
-                            continuation,
-                        }));
+                        // CPS trampoline loop: push a Native continuation frame,
+                        // then call the callback via ECFLO. If the callback is
+                        // bytecode, the exec loop drives it and the Return handler
+                        // invokes the continuation. If native, it completes inline
+                        // and we invoke the continuation here, looping if it
+                        // yields again.
+                        loop {
+                            self.frames.push(Frame::Native(NativeFrame {
+                                function: callee_ptr,
+                                continuation: cb_cont,
+                            }));
 
-                        // Push the callback arguments onto the eval stack.
-                        let callback_locals_offset = StackIndex::from_raw(self.stack.len());
-                        self.stack.extend(callback_args);
+                            let arg_count = cb_args.len();
+                            let cb_locals = StackIndex::from_raw(self.stack.len());
+                            self.stack.extend(cb_args);
 
-                        // Push the bytecode frame for the callback.
-                        self.frames.push(Frame::Bytecode(BytecodeFrame {
-                            function: callee,
-                            instruction_ptr: 0,
-                            locals_offset: callback_locals_offset,
-                        }));
-                        self.allocate_real_locals_for_frame(callee)?;
+                            let result = self.execute_call_from_locals_offset(
+                                cb_callee, cb_locals, arg_count, frame_idx, function,
+                            )?;
 
-                        // Update the outer loop's frame pointer and function.
-                        *frame_idx = self.frames.len() - 1;
-
-                        // SAFETY: See `load_function` doc comment.
-                        *function = unsafe { self.load_function(*frame_idx)? };
+                            match self.frames.last() {
+                                Some(Frame::Bytecode(_)) => {
+                                    // Callback is bytecode — exec loop will run it.
+                                    return Ok(result);
+                                }
+                                Some(Frame::Native(_)) => {
+                                    // Callback was native — completed inline,
+                                    // result is on the top of the stack.
+                                    // The top frame is our own continuation frame.
+                                    let v = self.stack.ensure_pop()?;
+                                    let Some(Frame::Native(nf)) = self.frames.pop() else {
+                                        unreachable!("just matched Frame::Native");
+                                    };
+                                    match nf.continuation.call(self, v) {
+                                        NativeCallResult::Done(val) => {
+                                            self.stack.push(val);
+                                            break;
+                                        }
+                                        NativeCallResult::Error(e) => {
+                                            return Err(self.native_error_to_vm_error(e));
+                                        }
+                                        NativeCallResult::YieldToCall {
+                                            callee,
+                                            args,
+                                            continuation,
+                                        } => {
+                                            cb_callee = callee;
+                                            cb_args = args;
+                                            cb_cont = continuation;
+                                        }
+                                    }
+                                }
+                                _ => unreachable!("at least our own frame should be here"),
+                            }
+                        }
                     }
                 }
             }
@@ -1488,6 +1513,15 @@ impl BexVm {
         }
 
         Ok(None)
+    }
+
+    /// Convert a [`VmRustFnError`] into the corresponding [`VmError`].
+    fn native_error_to_vm_error(&mut self, err: VmRustFnError) -> VmError {
+        match err {
+            VmRustFnError::Panic(panic) => VmError::Thrown(self.panic_to_exception_value(panic)),
+            VmRustFnError::BamlError(err) => VmError::Thrown(self.error_to_exception_value(err)),
+            VmRustFnError::InternalError(err) => VmError::InternalError(err),
+        }
     }
 
     // Runs filters and returns remaining notifications for the watched node.
@@ -3015,60 +3049,74 @@ impl BexVm {
                 // If the frame below is a Native continuation frame, invoke
                 // the continuation with the result and handle its outcome.
                 if matches!(self.frames.last(), Some(Frame::Native(_))) {
-                    // Pop the result we just pushed; the continuation will
-                    // produce the final value (or yield again).
                     let callback_result = self.stack.ensure_pop()?;
-
-                    // Pop the Native frame and extract the continuation.
                     let Some(Frame::Native(nf)) = self.frames.pop() else {
                         unreachable!("just matched Some(Frame::Native(_))");
                     };
+                    let native_fn_ptr = nf.function;
 
                     match nf.continuation.call(self, callback_result) {
                         NativeCallResult::Done(v) => {
                             self.stack.push(v);
                         }
-                        NativeCallResult::Error(VmRustFnError::Panic(panic)) => {
-                            return Err(VmError::Thrown(self.panic_to_exception_value(panic)));
-                        }
-                        NativeCallResult::Error(VmRustFnError::BamlError(err)) => {
-                            return Err(VmError::Thrown(self.error_to_exception_value(err)));
-                        }
-                        NativeCallResult::Error(VmRustFnError::InternalError(err)) => {
-                            return Err(VmError::InternalError(err));
+                        NativeCallResult::Error(e) => {
+                            return Err(self.native_error_to_vm_error(e));
                         }
                         NativeCallResult::YieldToCall {
-                            callee,
-                            args: callback_args,
-                            continuation,
+                            callee: mut cb_callee,
+                            args: mut cb_args,
+                            continuation: mut cb_cont,
                         } => {
-                            // The continuation wants to call another bytecode
-                            // function. Push another Native frame + Bytecode frame
-                            // and resume the execution loop.
-                            let next_locals_offset = StackIndex::from_raw(self.stack.len());
-                            self.stack.extend(callback_args);
+                            // Same trampoline loop as in ECFLO: push
+                            // Native frame, call ECFLO, check top frame.
+                            loop {
+                                self.frames.push(Frame::Native(NativeFrame {
+                                    function: native_fn_ptr,
+                                    continuation: cb_cont,
+                                }));
 
-                            // Re-use the same native function pointer from the
-                            // frame we just popped.
-                            self.frames.push(Frame::Native(NativeFrame {
-                                function: nf.function,
-                                continuation,
-                            }));
-                            self.frames.push(Frame::Bytecode(BytecodeFrame {
-                                function: callee,
-                                instruction_ptr: 0,
-                                locals_offset: next_locals_offset,
-                            }));
-                            self.allocate_real_locals_for_frame(callee)?;
+                                let arg_count = cb_args.len();
+                                let cb_locals = StackIndex::from_raw(self.stack.len());
+                                self.stack.extend(cb_args);
 
-                            *frame_idx = self.frames.len() - 1;
+                                let ecflo_result = self.execute_call_from_locals_offset(
+                                    cb_callee, cb_locals, arg_count, frame_idx, function,
+                                )?;
 
-                            // SAFETY: See `load_function` doc comment.
-                            *function = unsafe { self.load_function(*frame_idx)? };
-
-                            // Return Ok(None) so the exec loop calls step()
-                            // again, starting execution of the new bytecode frame.
-                            return Ok(None);
+                                match self.frames.last() {
+                                    Some(Frame::Bytecode(_)) => {
+                                        if ecflo_result.is_some() {
+                                            return Ok(ecflo_result);
+                                        }
+                                        return Ok(None);
+                                    }
+                                    Some(Frame::Native(_)) => {
+                                        let v = self.stack.ensure_pop()?;
+                                        let Some(Frame::Native(nf)) = self.frames.pop() else {
+                                            unreachable!("just matched Frame::Native");
+                                        };
+                                        match nf.continuation.call(self, v) {
+                                            NativeCallResult::Done(val) => {
+                                                self.stack.push(val);
+                                                break;
+                                            }
+                                            NativeCallResult::Error(e) => {
+                                                return Err(self.native_error_to_vm_error(e));
+                                            }
+                                            NativeCallResult::YieldToCall {
+                                                callee,
+                                                args,
+                                                continuation,
+                                            } => {
+                                                cb_callee = callee;
+                                                cb_args = args;
+                                                cb_cont = continuation;
+                                            }
+                                        }
+                                    }
+                                    _ => unreachable!("frames cannot be empty after ECFLO"),
+                                }
+                            }
                         }
                     }
                 }
